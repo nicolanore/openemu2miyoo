@@ -1,18 +1,25 @@
 #!/bin/bash
 
-# Database connection details (replace with your actual values)
+# Script to convert OpenEmu game library artwork for Miyoo devices
+
+# --- Configuration ---
 OPEN_EMU_LIBRARY="$HOME/Library/Application Support/OpenEmu/Game Library"
-DB_FILE="$OPEN_EMU_LIBRARY/Library.storedata"  # Path to your SQLite database
+DB_FILE="$OPEN_EMU_LIBRARY/Library.storedata"
 IMAGES_SOURCE_DIR="$OPEN_EMU_LIBRARY/Artwork"
 OUTPUT_DIR="$HOME/OpenEmu2Miyoo"
 
 MAX_IMAGE_HEIGHT=360
 MAX_IMAGE_WIDTH=250
 
-# Create the output directory if it doesn't exist
-mkdir -p "$OUTPUT_DIR"
+# --- Helper Functions ---
 
-find_console_folder() {
+# Check if a command exists
+command_exists () {
+  command -v "$1" >/dev/null 2>&1
+}
+
+# Function to map OpenEmu console names to Miyoo folder names
+map_console_to_miyoo_folder() {
   local console="$1"
   local folder=""
 
@@ -41,16 +48,68 @@ find_console_folder() {
     "Vectrex") folder="VECTREX" ;;
     "Virtual Boy") folder="VB" ;;
     "WonderSwan") folder="WS" ;;
-    *) echo "Error: Folder not found for console '$console'" >&2
-       echo "$1" | sed 's/[^a-zA-Z0-9._-]//g' # keep only letters, numbers, dots, underscores and hyphens
+    *)
+      echo "Warning: No specific Miyoo folder found for console '$console'. Using a sanitized version." >&2
+      folder=$(echo "$console" | sed 's/[^a-zA-Z0-9._-]//g')
+      ;;
   esac
 
-  if [ -n "$folder" ]; then
-    echo "$folder"
+  echo "$folder"
+}
+
+# Function to convert an image to PNG, and resize it while maintaining aspect ratio
+convert_to_png_and_resize_image() {
+  local image_path="$1"
+  local max_width="$2"
+  local max_height="$3"
+
+  if command_exists "sips"; then
+    local height=`sips --getProperty pixelHeight "$image_path" | sed -E "s/.*pixelHeight: ([0-9]+)/\1/g" | tail -1`
+    local width=`sips --getProperty pixelWidth "$image_path" | sed -E "s/.*pixelWidth: ([0-9]+)/\1/g" | tail -1`
+    # local width=$(sips --getProperty pixelWidth "$image_path" | awk '{print $2}')
+    # local height=$(sips --getProperty pixelHeight "$image_path" | awk '{print $2}')
+
+    if [[ -n "$width" && -n "$height" ]]; then
+      local resize_needed=0
+
+      if [[ "$width" -gt "$max_width" || "$height" -gt "$max_height" ]]; then
+        resize_needed=1
+      fi
+
+      # TODO format to PNG dans tous les cas
+      if [[ "$resize_needed" -eq 1 ]]; then
+        echo "[INFO] Resizing image '$image_path' to a maximum of ${max_width}x${max_height}"
+        local target_ratio=$(echo "$max_width / $max_height" | bc)
+        local image_ratio=$(echo "$width / $height" | bc)
+        if [[ $(echo "$image_ratio > $target_ratio" | bc) -eq 1 ]]; then
+          sips -s format png --resampleWidth "$max_width" "$image_path" -o "$image_path" > /dev/null
+        else
+          sips -s format png --resampleHeight "$max_height" "$image_path" -o "$image_path" > /dev/null
+        fi
+      else
+        # convert to PNG if not already
+        sips -s format png "$image_path" -o "$image_path" > /dev/null
+      fi
+    else
+      echo "[ERROR] Could not determine image dimensions for '$image_path'." >&2
+    fi
+  else
+    echo "[ERROR] 'sips' command not found. Please install it to enable image resizing." >&2
   fi
 }
 
-# SQL query
+# --- Main Script ---
+
+# Check for required commands
+if ! command_exists "sqlite3"; then
+  echo "Error: 'sqlite3' command not found. Please install it." >&2
+  exit 1
+fi
+
+# Create the output directory if it doesn't exist
+mkdir -p "$OUTPUT_DIR"
+
+# SQL query to fetch relevant data from OpenEmu
 SQL_QUERY="
 SELECT ZIMAGE.ZRELATIVEPATH, ZGAME.ZNAME, ZSYSTEM.ZLASTLOCALIZEDNAME
 FROM ZIMAGE
@@ -59,37 +118,35 @@ LEFT JOIN ZSYSTEM ON ZGAME.ZSYSTEM = ZSYSTEM.Z_PK;
 "
 
 # Execute the SQL query and process the results
-sqlite3 "$DB_FILE" "$SQL_QUERY" | while IFS=$'|' read -r RELATIVE_PATH GAME_NAME SYSTEM_NAME; do
-  if [[ -n "$RELATIVE_PATH" && -n "$GAME_NAME" && -n "$SYSTEM_NAME" ]]; then
-    SOURCE_FILE="$IMAGES_SOURCE_DIR/$RELATIVE_PATH"
-    SYSTEM_NAME_MAPPED_FOR_MIYOO=$(find_console_folder "$SYSTEM_NAME")
-    DESTINATION_FOLDER="$OUTPUT_DIR/${SYSTEM_NAME_MAPPED_FOR_MIYOO}/Img"
-    DESTINATION_FILE="${DESTINATION_FOLDER}/${GAME_NAME}.png"
+sqlite3 "$DB_FILE" "$SQL_QUERY" | while IFS=$'|' read -r relative_path game_name system_name; do
+  if [[ -n "$relative_path" && -n "$game_name" && -n "$system_name" ]]; then
+    source_file="$IMAGES_SOURCE_DIR/$relative_path"
+    miyoo_system_folder=$(map_console_to_miyoo_folder "$system_name")
+    destination_folder="$OUTPUT_DIR/${miyoo_system_folder}/Img"
+    destination_file="${destination_folder}/${game_name}.png"
 
-    if [[ -f "$SOURCE_FILE" ]]; then
-      echo "[INFO] Copy $SOURCE_FILE to $DESTINATION_FILE"
-      mkdir -p $DESTINATION_FOLDER
-      cp "$SOURCE_FILE" "$DESTINATION_FILE"
+    if [[ -f "$source_file" ]]; then
+      echo "[INFO] Processing: '$game_name' for system '$system_name'"
+      mkdir -p "$destination_folder"
 
-      echo "[INFO] Resize the image $DESTINATION_FILE to a maximum of ${MAX_IMAGE_WIDTH}x${MAX_IMAGE_HEIGHT}"
-      # sips -s format png -Z 250 "$DESTINATION_FILE" -o "$DESTINATION_FILE" > /dev/null
-      height=`sips --getProperty pixelHeight "$DESTINATION_FILE" | sed -E "s/.*pixelHeight: ([0-9]+)/\1/g" | tail -1`
-      if [[ $height -gt $MAX_IMAGE_HEIGHT ]]; then
-          sips -s format png --resampleHeight $MAX_IMAGE_HEIGHT "$DESTINATION_FILE" -o "$DESTINATION_FILE" > /dev/null
-      fi
-      width=`sips --getProperty pixelWidth "$DESTINATION_FILE" | sed -E "s/.*pixelWidth: ([0-9]+)/\1/g" | tail -1`
-      if [[ $width -gt $MAX_IMAGE_WIDTH ]]; then
-          sips -s format png --resampleWidth $MAX_IMAGE_WIDTH "$DESTINATION_FILE" -o "$DESTINATION_FILE" > /dev/null
+      # Copy the image
+      if cp "$source_file" "$destination_file"; then
+        echo "[INFO] Copied '$source_file' to '$destination_file'"
+        convert_to_png_and_resize_image "$destination_file" "$MAX_IMAGE_WIDTH" "$MAX_IMAGE_HEIGHT"
+      else
+        echo "[ERROR] Failed to copy '$source_file' to '$destination_file'" >&2
       fi
     else
-      echo "[WARN] Source file not found: $SOURCE_FILE"
+      echo "[WARN] Source file not found: '$source_file'" >&2
     fi
 
+  elif [[ -z "$relative_path" && -z "$game_name" && -z "$system_name" ]]; then
+    echo "[DEBUG] Skipping empty line from sqlite3 output."
   else
-    if [[ -z "$RELATIVE_PATH" && -z "$GAME_NAME" && -z "$SYSTEM_NAME" ]]; then
-      echo "[WARN] Empty line from sqlite3 output. Skipping."
-    else
-      echo "[WARN] Missing data in line from sqlite3 output. Relative path: $RELATIVE_PATH, Game name: $GAME_NAME, System name: $SYSTEM_NAME"
-    fi
+    echo "[WARN] Missing data in line from sqlite3 output. Relative path: '$relative_path', Game name: '$game_name', System name: '$system_name'" >&2
   fi
 done
+
+echo "[INFO] Artwork conversion process completed."
+
+exit 0
